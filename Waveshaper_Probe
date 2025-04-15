@@ -9,14 +9,16 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Generate a stepped wave from -1 to +1 at 48kHz.
 # Each step is held for samples_per_step frames.
-# The first and last steps are duplicated to isolate clicks.
+# The first and last steps are duplicated so that they can be ignored
+# during analysis (making the test robust against transient clicks).
 # Bit depth can be either 16 or 32.
-def generate_stepped_wave(filename, num_steps=8, samples_per_step=1024, fs=48000, bit_depth=32):
+def generate_stepped_wave(filename, num_steps=8192, samples_per_step=1024, fs=48000, bit_depth=32):
+    # Generate evenly spaced step values in the range [-1,1].
     step_values = np.linspace(-1.0, 1.0, num_steps, endpoint=True).astype(np.float32)
     blocks = []
     # Duplicate the first step.
     blocks.append(np.full(samples_per_step, step_values[0], dtype=np.float32))
-    # All steps.
+    # Generate the actual steps.
     for val in step_values:
         blocks.append(np.full(samples_per_step, val, dtype=np.float32))
     # Duplicate the last step.
@@ -39,7 +41,7 @@ def generate_stepped_wave(filename, num_steps=8, samples_per_step=1024, fs=48000
     wf.writeframes(data.tobytes())
     wf.close()
 
-# Load a WAV file (supports 8/16/24/32-bit PCM) and extract the left channel if stereo.
+# Load a WAV file (supports 8/16/24/32-bit PCM) and extract left channel if stereo.
 def load_wave_any_depth(filename):
     with wave.open(filename, 'rb') as wf:
         nchan = wf.getnchannels()
@@ -58,9 +60,9 @@ def load_wave_any_depth(filename):
         num_samples = len(raw_bytes) // 3
         samples_32 = np.empty(num_samples, dtype=np.int32)
         for i in range(num_samples):
-            b0 = raw_bytes[3 * i]
-            b1 = raw_bytes[3 * i + 1]
-            b2 = raw_bytes[3 * i + 2]
+            b0 = raw_bytes[3*i + 0]
+            b1 = raw_bytes[3*i + 1]
+            b2 = raw_bytes[3*i + 2]
             val = (b2 << 16) | (b1 << 8) | b0
             if val & 0x800000:
                 val = val - 0x1000000
@@ -83,7 +85,7 @@ def load_wave_any_depth(filename):
 def analyze_steps(input_signal, output_signal, num_steps, samples_per_step):
     step_in = []
     step_out = []
-    # Total blocks = num_steps + 2; ignore the first and last blocks.
+    # There are a total of num_steps + 2 blocks; ignore block 0 and block num_steps+1.
     for i in range(1, num_steps + 1):
         start_idx = i * samples_per_step
         end_idx = start_idx + samples_per_step
@@ -102,6 +104,17 @@ def normalize_curve(y):
     if ymax == ymin:
         return y
     return 2.0 * (y - ymin) / (ymax - ymin) - 1.0
+
+# Plot input-output curve from the mean step values.
+def plot_io_curve(x, y):
+    plt.figure()
+    plt.plot(x, y, 'o-', markersize=3, linewidth=1, label="Measured")
+    plt.xlabel("Input Amplitude")
+    plt.ylabel("Output Amplitude")
+    plt.title("Waveshaper Input-Output Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 # Generate a C++ style array string from the lookup table data.
 def generate_cpp_array(data):
@@ -134,17 +147,16 @@ class WaveShaperTestUI(tk.Tk):
     def __init__(self):
         tk.Tk.__init__(self)
         self.title("Waveshaper Test Utility")
-        self.geometry("900x700")
+        self.geometry("900x600")
         
         # Top instructions.
         instr_text = (
             "Waveshaper Test Utility\n\n"
-            "Instructions:\n"
-            "  - Set step resolution (number of steps between -1 and 1).\n"
+            "  - Set Quality Factor (number of steps) for resolution (default is 8192).\n"
             "  - Choose probe output bit depth (16-bit or 32-bit; 32-bit is recommended).\n"
-            "  - Generate a stepped test wave (.wav) (first and last steps are duplicated).\n"
+            "  - Generate a stepped test wave (.wav) (with duplicated first and last steps).\n"
             "  - Load the processed wave (.wav) from your waveshaper (expected to be 24-bit).\n"
-            "  - Analyze & plot the measured input-output curve (ignores duplicated first and last steps).\n"
+            "  - Analyze & plot the measured input-output curve (ignores the duplicated steps).\n"
             "  - Export the measured lookup table (LUT) as a C++ array.\n"
         )
         self.top_label = tk.Label(self, text=instr_text, justify="left", font=("Arial", 10))
@@ -159,16 +171,16 @@ class WaveShaperTestUI(tk.Tk):
         self.left_frame.pack(expand=True, fill="both", padx=5, pady=5)
         tk.Label(self.left_frame, text="Test Wave & LUT Export", font=("Arial", 12, "bold")).pack(pady=10)
         
-        # Parameters frame: step resolution slider and bit depth options.
+        # Parameters frame: quality slider and bit depth options.
         param_frame = tk.Frame(self.left_frame)
         param_frame.pack(pady=5, padx=10, fill="x")
         
-        # Step resolution slider.
-        res_label = tk.Label(param_frame, text="Step Resolution:")
-        res_label.grid(row=0, column=0, sticky="w")
-        self.res_scale = tk.Scale(param_frame, from_=1, to=10, orient=tk.HORIZONTAL)
-        self.res_scale.set(8)
-        self.res_scale.grid(row=0, column=1, sticky="we")
+        # Quality slider.
+        quality_label = tk.Label(param_frame, text="Quality Factor (Number of Steps):")
+        quality_label.grid(row=0, column=0, sticky="w")
+        self.quality_scale = tk.Scale(param_frame, from_=1, to=16384, orient=tk.HORIZONTAL)
+        self.quality_scale.set(8192)
+        self.quality_scale.grid(row=0, column=1, sticky="we")
         
         # Bit depth selection.
         bit_depth_label = tk.Label(param_frame, text="Probe Output Bit Depth:")
@@ -179,7 +191,7 @@ class WaveShaperTestUI(tk.Tk):
         rb32 = tk.Radiobutton(param_frame, text="32-bit", variable=self.bit_depth_var, value=32)
         rb32.grid(row=1, column=2, sticky="w")
         
-        # Buttons.
+        # Left frame buttons.
         self.btn_generate = tk.Button(self.left_frame, text="Generate Stepped Test Wave (.wav)", command=self.on_generate)
         self.btn_generate.pack(pady=5, fill="x", padx=10)
         self.btn_load_processed = tk.Button(self.left_frame, text="Load Processed Wave (.wav)", command=self.on_load_processed)
@@ -212,7 +224,7 @@ class WaveShaperTestUI(tk.Tk):
         self.in_steps = None
         self.out_steps = None
         # Store resolution parameters.
-        self.num_steps = 8
+        self.num_steps = 8192
         self.samples_per_step = 1024
 
     def on_generate(self):
@@ -225,7 +237,8 @@ class WaveShaperTestUI(tk.Tk):
             messagebox.showwarning("Warning", "No file selected.")
             return
         try:
-            self.num_steps = int(self.res_scale.get())
+            # Directly use the quality factor as the number of steps.
+            self.num_steps = int(self.quality_scale.get())
             self.samples_per_step = 1024
             bit_depth = self.bit_depth_var.get()
             generate_stepped_wave(path, num_steps=self.num_steps, samples_per_step=self.samples_per_step, fs=48000, bit_depth=bit_depth)
@@ -260,23 +273,14 @@ class WaveShaperTestUI(tk.Tk):
             self.orig_data, self.fs_orig = load_wave_any_depth(self.test_wave_path)
             in_steps, out_steps = analyze_steps(self.orig_data, self.proc_data, num_steps=self.num_steps, samples_per_step=self.samples_per_step)
             if len(in_steps) == 0 or len(out_steps) == 0:
-                messagebox.showwarning("Warning", "No valid step blocks found. Possibly the test wave is too short.")
+                messagebox.showwarning("Warning", "No valid step blocks found. Possibly too short.")
                 return
+            # Normalize the measured curves.
             self.in_steps = normalize_curve(in_steps)
             self.out_steps = normalize_curve(out_steps)
-            self.update_measured_plot()
+            plot_io_curve(self.in_steps, self.out_steps)
         except Exception as e:
             messagebox.showerror("Error", str(e))
-
-    def update_measured_plot(self):
-        self.measured_ax.clear()
-        self.measured_ax.plot(self.in_steps, self.out_steps, 'o-', markersize=3, linewidth=1, label="Measured")
-        self.measured_ax.set_xlabel("Input Amplitude")
-        self.measured_ax.set_ylabel("Output Amplitude")
-        self.measured_ax.set_title("Waveshaper Input-Output Curve")
-        self.measured_ax.legend()
-        self.measured_ax.grid(True)
-        self.measured_canvas.draw()
 
     def on_export_array(self):
         if self.out_steps is None:
