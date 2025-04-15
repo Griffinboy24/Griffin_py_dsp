@@ -6,30 +6,35 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Generate a stepped wave from -1 to +1 at 48kHz.
 # Each step is held for samples_per_step frames.
-# The first and last steps are duplicated so they can be ignored during analysis.
+# Instead of silence pads, the first and last steps are duplicated.
 # Bit depth can be either 16 or 32.
 def generate_stepped_wave(filename, num_steps=8192, samples_per_step=1024, fs=48000, bit_depth=32):
-    # Generate evenly spaced step values in the range [-1,1].
+    pad_samples = 1024
+    # Generate evenly spaced step values in the range [-1, 1].
     step_values = np.linspace(-1.0, 1.0, num_steps, endpoint=True).astype(np.float32)
     blocks = []
     # Duplicate the first step.
     blocks.append(np.full(samples_per_step, step_values[0], dtype=np.float32))
-    # All the test steps.
+    # Append each test step.
     for val in step_values:
         blocks.append(np.full(samples_per_step, val, dtype=np.float32))
     # Duplicate the last step.
     blocks.append(np.full(samples_per_step, step_values[-1], dtype=np.float32))
     signal = np.concatenate(blocks, axis=0)
     
+    # Convert to integer data.
     if bit_depth == 16:
         data = np.clip(signal, -1.0, 1.0)
         data = (data * 32767.0).astype(np.int16)
     elif bit_depth == 32:
         data = np.clip(signal, -1.0, 1.0)
-        data = (data * 2147483647.0).astype(np.int32)
+        # Use double precision multiplication and round for safety.
+        data = (data.astype(np.float64) * 2147483647.0)
+        data = np.rint(data).astype(np.int32)
     else:
         raise ValueError("Only 16-bit and 32-bit supported for probe generation.")
     
@@ -41,24 +46,13 @@ def generate_stepped_wave(filename, num_steps=8192, samples_per_step=1024, fs=48
     wf.close()
 
 # Load a WAV file (supports 8/16/24/32-bit PCM) and extract left channel if stereo.
-# Reads the file in chunks while invoking progress_callback(percent) updates.
-def load_wave_any_depth_progress(filename, progress_callback=None):
+def load_wave_any_depth(filename):
     with wave.open(filename, 'rb') as wf:
         nchan = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         fs = wf.getframerate()
         nframes = wf.getnframes()
-        chunk_size = 1024
-        total_read = 0
-        chunks = []
-        while total_read < nframes:
-            frames_to_read = min(chunk_size, nframes - total_read)
-            chunk = wf.readframes(frames_to_read)
-            chunks.append(chunk)
-            total_read += frames_to_read
-            if progress_callback:
-                progress_callback(total_read / nframes * 100)
-        raw_bytes = b"".join(chunks)
+        raw_bytes = wf.readframes(nframes)
     
     if sampwidth == 1:
         samples = np.frombuffer(raw_bytes, dtype=np.int8)
@@ -90,14 +84,63 @@ def load_wave_any_depth_progress(filename, progress_callback=None):
     float_data = samples.astype(np.float32) / max_val
     return float_data, fs
 
-# Analyze stepped data by measuring the mean amplitude of each step in both signals.
-# Ignores the duplicated first and last steps.
+# Load a WAV file in chunks and update progress using a callback.
+def load_wave_any_depth_progress(filename, progress_callback=None):
+    with wave.open(filename, 'rb') as wf:
+        nchan = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        fs = wf.getframerate()
+        nframes = wf.getnframes()
+        chunk_size = 1024
+        total_read = 0
+        chunks = []
+        while total_read < nframes:
+            frames_to_read = min(chunk_size, nframes - total_read)
+            chunk = wf.readframes(frames_to_read)
+            chunks.append(chunk)
+            total_read += frames_to_read
+            if progress_callback:
+                progress_callback(total_read / nframes * 100)
+        raw_bytes = b"".join(chunks)
+    
+    if sampwidth == 1:
+        samples = np.frombuffer(raw_bytes, dtype=np.int8)
+        max_val = 127.0
+    elif sampwidth == 2:
+        samples = np.frombuffer(raw_bytes, dtype=np.int16)
+        max_val = 32767.0
+    elif sampwidth == 3:
+        num_samples = len(raw_bytes) // 3
+        samples = np.empty(num_samples, dtype=np.int32)
+        for i in range(num_samples):
+            b0 = raw_bytes[3*i]
+            b1 = raw_bytes[3*i + 1]
+            b2 = raw_bytes[3*i + 2]
+            val = (b2 << 16) | (b1 << 8) | b0
+            if val & 0x800000:
+                val -= 0x1000000
+            samples[i] = val
+        max_val = 8388607.0
+    elif sampwidth == 4:
+        samples = np.frombuffer(raw_bytes, dtype=np.int32)
+        max_val = 2147483647.0
+    else:
+        raise ValueError("Unsupported sample width: {} bytes".format(sampwidth))
+    
+    if nchan > 1:
+        samples = samples[0::nchan]
+    float_data = samples.astype(np.float32) / max_val
+    return float_data, fs
+
+# Analyze stepped data by computing the mean amplitude of each step in both signals.
+# The first and last blocks (duplicates) are ignored.
 def analyze_steps(input_signal, output_signal, num_steps, samples_per_step):
+    pad_samples = 1024
     step_in = []
     step_out = []
-    # There are num_steps + 2 blocks in total; ignore block 0 and block num_steps+1.
-    for i in range(1, num_steps + 1):
-        start_idx = i * samples_per_step
+    # Total blocks = num_steps + 2; ignore block 0 and block num_steps+1.
+    for i in range(num_steps):
+        start_idx = pad_samples + i * samples_per_step
         end_idx = start_idx + samples_per_step
         if end_idx > len(input_signal) or end_idx > len(output_signal):
             break
@@ -116,9 +159,8 @@ def normalize_curve(y):
     return 2.0 * (y - ymin) / (ymax - ymin) - 1.0
 
 # Plot the measured input-output curve.
-# Only the measured points are plotted (as very small dots)
-# and a 1:1 ideal reference line (orange, super thin) is drawn in the background.
-def plot_io_curve(x, y):
+# Measured points are very small dots and a super-thin orange 1:1 line is drawn.
+def plot_io_curve(x, y, custom_x=None, custom_y=None):
     plt.figure()
     plt.plot(x, y, 'o', markersize=1, label="Measured")
     plt.plot([-1, 1], [-1, 1], color='orange', linewidth=0.5, label="Ideal")
@@ -165,12 +207,16 @@ class WaveShaperTestUI(tk.Tk):
         # Top instructions.
         instr_text = (
             "Waveshaper Test Utility\n\n"
-            "  - Set Quality Exponent (steps = 2^(exponent)); default is 13 (i.e. 8192 steps).\n"
+            "Left Column:\n"
+            "  - Set quality factor (direct number of steps); default is 8192.\n"
             "  - Choose probe output bit depth (16-bit or 32-bit; 32-bit is recommended).\n"
             "  - Generate a stepped test wave (.wav) with duplicated first and last steps.\n"
             "  - Load the processed wave (.wav) from your waveshaper (expected to be 24-bit).\n"
-            "  - Upon loading, the wave is automatically decoded and graphed.\n"
-            "  - Export the measured lookup table (LUT) as a C++ array.\n"
+            "  - Analyze & plot the measured input-output curve.\n"
+            "  - Export the measured lookup table (LUT) as a C++ array.\n\n"
+            "Right Column:\n"
+            "  - Enter a custom waveshaper expression (use 'x' for input), e.g. np.clip(np.tanh(3*x), -0.8, 0.8).\n"
+            "  - The custom curve updates automatically as you edit."
         )
         self.top_label = tk.Label(self, text=instr_text, justify="left", font=("Arial", 10))
         self.top_label.pack(pady=10, padx=10, fill="x")
@@ -181,18 +227,19 @@ class WaveShaperTestUI(tk.Tk):
         
         # Left frame: Test wave generation, loading, analysis and LUT export.
         self.left_frame = tk.Frame(main_frame, relief="groove", borderwidth=2)
-        self.left_frame.pack(expand=True, fill="both", padx=5, pady=5)
+        self.left_frame.pack(side="left", expand=True, fill="both", padx=5, pady=5)
         tk.Label(self.left_frame, text="Test Wave & LUT Export", font=("Arial", 12, "bold")).pack(pady=10)
         
         # Parameters frame: quality slider and bit depth options.
         param_frame = tk.Frame(self.left_frame)
         param_frame.pack(pady=5, padx=10, fill="x")
         
-        # Quality slider (exponent, since steps = 2^(exponent)).
-        quality_label = tk.Label(param_frame, text="Quality Exponent (steps = 2^x):")
+        # Quality slider: directly representing the number of steps.
+        # Range from 256 to 32768 in steps of 256, default 8192.
+        quality_label = tk.Label(param_frame, text="Quality Factor (Number of Steps):")
         quality_label.grid(row=0, column=0, sticky="w")
-        self.quality_scale = tk.Scale(param_frame, from_=1, to=16, orient=tk.HORIZONTAL)
-        self.quality_scale.set(13)
+        self.quality_scale = tk.Scale(param_frame, from_=256, to=32768, resolution=256, orient=tk.HORIZONTAL)
+        self.quality_scale.set(8192)
         self.quality_scale.grid(row=0, column=1, sticky="we")
         
         # Bit depth selection.
@@ -204,20 +251,40 @@ class WaveShaperTestUI(tk.Tk):
         rb32 = tk.Radiobutton(param_frame, text="32-bit", variable=self.bit_depth_var, value=32)
         rb32.grid(row=1, column=2, sticky="w")
         
-        # Buttons.
+        # Left frame buttons.
         self.btn_generate = tk.Button(self.left_frame, text="Generate Stepped Test Wave (.wav)", command=self.on_generate)
         self.btn_generate.pack(pady=5, fill="x", padx=10)
         self.btn_load_processed = tk.Button(self.left_frame, text="Load Processed Wave (.wav)", command=self.on_load_processed)
         self.btn_load_processed.pack(pady=5, fill="x", padx=10)
+        self.btn_analyze = tk.Button(self.left_frame, text="Analyze & Plot Measured Curve", command=self.on_analyze)
+        self.btn_analyze.pack(pady=5, fill="x", padx=10)
         self.btn_export = tk.Button(self.left_frame, text="Export Measured LUT (C++ Array)", command=self.on_export_array)
         self.btn_export.pack(pady=5, fill="x", padx=10)
         
-        # Progress bar (hidden by default)
-        self.progress_bar = ttk.Progressbar(self.left_frame, orient='horizontal', mode='determinate')
+        # Right frame: Custom waveshaper comparison.
+        self.right_frame = tk.Frame(main_frame, relief="groove", borderwidth=2)
+        self.right_frame.pack(side="right", expand=True, fill="both", padx=5, pady=5)
+        tk.Label(self.right_frame, text="Custom Waveshaper Comparison", font=("Arial", 12, "bold")).pack(pady=10)
+        tk.Label(self.right_frame, text="Enter expression (use 'x' for input):", font=("Arial", 10)).pack(pady=5)
+        self.custom_entry = tk.Entry(self.right_frame, width=50)
+        self.custom_entry.insert(0, "np.clip(np.tanh(3*x), -0.8, 0.8)")
+        self.custom_entry.pack(pady=5)
+        # Embedded matplotlib canvas for realtime custom curve display.
+        self.custom_fig = plt.Figure(figsize=(5, 4), dpi=100)
+        self.custom_ax = self.custom_fig.add_subplot(111)
+        self.custom_canvas = FigureCanvasTkAgg(self.custom_fig, master=self.right_frame)
+        self.custom_canvas.draw()
+        self.custom_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # Bind key release event for automatic custom plot updates.
+        self.custom_entry.bind("<KeyRelease>", self.on_custom_entry_key_release)
+        self.custom_update_job = None
         
         # Quit button.
         self.btn_quit = tk.Button(self, text="Quit", command=self.quit)
         self.btn_quit.pack(pady=10)
+        
+        # Progress bar for loading a processed wave.
+        self.progress_bar = ttk.Progressbar(self.left_frame, orient='horizontal', mode='determinate')
         
         # Internal data variables.
         self.test_wave_path = None
@@ -228,7 +295,7 @@ class WaveShaperTestUI(tk.Tk):
         self.fs_proc = None
         self.in_steps = None
         self.out_steps = None
-        # Store resolution parameters.
+        # Parameters for generation and analysis.
         self.num_steps = 8192
         self.samples_per_step = 1024
 
@@ -242,12 +309,12 @@ class WaveShaperTestUI(tk.Tk):
             messagebox.showwarning("Warning", "No file selected.")
             return
         try:
-            # Use the quality exponent slider to set the number of steps (2^(exponent)).
-            exponent = int(self.quality_scale.get())
-            self.num_steps = 2 ** exponent
+            self.num_steps = int(self.quality_scale.get())
             self.samples_per_step = 1024
             bit_depth = self.bit_depth_var.get()
-            generate_stepped_wave(path, num_steps=self.num_steps, samples_per_step=self.samples_per_step, fs=48000, bit_depth=bit_depth)
+            generate_stepped_wave(path, num_steps=self.num_steps,
+                                  samples_per_step=self.samples_per_step,
+                                  fs=48000, bit_depth=bit_depth)
             self.test_wave_path = path
             self.top_label.config(text=f"Test wave generated at:\n{path}\nProcess it externally using your waveshaper.")
         except Exception as e:
@@ -264,14 +331,13 @@ class WaveShaperTestUI(tk.Tk):
         if not path:
             messagebox.showwarning("Warning", "No file selected.")
             return
-
-        # Show progress bar.
-        self.progress_bar.pack(pady=5, padx=10, fill='x')
+        
+        # Display progress bar.
+        self.progress_bar.pack(pady=5, padx=10, fill="x")
         self.progress_bar["value"] = 0
         self.update_idletasks()
-
+        
         try:
-            # Load with progress updates.
             def progress_update(percent):
                 self.progress_bar["value"] = percent
                 self.update_idletasks()
@@ -282,20 +348,21 @@ class WaveShaperTestUI(tk.Tk):
             messagebox.showerror("Error", str(e))
             self.progress_bar.pack_forget()
             return
-
-        # Hide progress bar now that loading is done.
+        
         self.progress_bar.pack_forget()
-        # Automatically run analysis if test wave is available.
+        # Automatically run analysis if a test wave has been generated.
         if self.test_wave_path is not None:
             self.on_analyze()
 
     def on_analyze(self):
-        if not self.test_wave_path or self.proc_data is None:
+        if not self.test_wave_path or not self.proc_wave_path:
             messagebox.showwarning("Warning", "Both a test wave and a processed wave are required.")
             return
         try:
             self.orig_data, self.fs_orig = load_wave_any_depth(self.test_wave_path)
-            in_steps, out_steps = analyze_steps(self.orig_data, self.proc_data, num_steps=self.num_steps, samples_per_step=self.samples_per_step)
+            in_steps, out_steps = analyze_steps(self.orig_data, self.proc_data,
+                                                num_steps=self.num_steps,
+                                                samples_per_step=self.samples_per_step)
             if len(in_steps) == 0 or len(out_steps) == 0:
                 messagebox.showwarning("Warning", "No valid step blocks found. Possibly too short.")
                 return
@@ -303,8 +370,49 @@ class WaveShaperTestUI(tk.Tk):
             self.in_steps = normalize_curve(in_steps)
             self.out_steps = normalize_curve(out_steps)
             plot_io_curve(self.in_steps, self.out_steps)
+            self.update_custom_plot()
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    def on_custom_entry_key_release(self, event):
+        if self.custom_update_job is not None:
+            self.after_cancel(self.custom_update_job)
+        self.custom_update_job = self.after(300, self.update_custom_plot)
+
+    def update_custom_plot(self):
+        expr = self.custom_entry.get().strip()
+        if expr.startswith("="):
+            expr = expr[1:].strip()
+        self.custom_ax.clear()
+        safe_env = {
+            "np": np,
+            "sin": np.sin,
+            "cos": np.cos,
+            "tanh": np.tanh,
+            "abs": np.abs,
+            "exp": np.exp,
+            "log": np.log,
+            "sqrt": np.sqrt
+        }
+        try:
+            num_points = len(self.out_steps) if self.out_steps is not None else 1024
+            x_custom = np.linspace(-1, 1, num_points)
+            y_custom = eval(expr, {"__builtins__": None, **safe_env}, {"x": x_custom})
+            y_custom = normalize_curve(y_custom)
+            if self.in_steps is not None and self.out_steps is not None:
+                self.custom_ax.plot(self.in_steps, self.out_steps, 'o', markersize=2, linewidth=0.5, label="Measured")
+            self.custom_ax.plot(x_custom, y_custom, 'x--', markersize=2, linewidth=0.5, label="Custom")
+            self.custom_ax.set_xlabel("Input Amplitude")
+            self.custom_ax.set_ylabel("Output Amplitude")
+            self.custom_ax.set_title("Custom Waveshaper Comparison")
+            self.custom_ax.legend()
+            self.custom_ax.grid(True)
+        except Exception as e:
+            self.custom_ax.text(0.5, 0.5, "Error: " + str(e),
+                                horizontalalignment='center',
+                                verticalalignment='center',
+                                transform=self.custom_ax.transAxes)
+        self.custom_canvas.draw()
 
     def on_export_array(self):
         if self.out_steps is None:
