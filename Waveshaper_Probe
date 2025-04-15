@@ -1,0 +1,307 @@
+import sys
+import wave
+import struct
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# Generate a stepped wave from -1 to +1 at 48kHz.
+# Each step is held for samples_per_step frames.
+# The first and last steps are duplicated to isolate clicks.
+# Bit depth can be either 16 or 32.
+def generate_stepped_wave(filename, num_steps=8, samples_per_step=1024, fs=48000, bit_depth=32):
+    step_values = np.linspace(-1.0, 1.0, num_steps, endpoint=True).astype(np.float32)
+    blocks = []
+    # Duplicate the first step.
+    blocks.append(np.full(samples_per_step, step_values[0], dtype=np.float32))
+    # All steps.
+    for val in step_values:
+        blocks.append(np.full(samples_per_step, val, dtype=np.float32))
+    # Duplicate the last step.
+    blocks.append(np.full(samples_per_step, step_values[-1], dtype=np.float32))
+    signal = np.concatenate(blocks, axis=0)
+    
+    if bit_depth == 16:
+        data = np.clip(signal, -1.0, 1.0)
+        data = (data * 32767.0).astype(np.int16)
+    elif bit_depth == 32:
+        data = np.clip(signal, -1.0, 1.0)
+        data = (data * 2147483647.0).astype(np.int32)
+    else:
+        raise ValueError("Only 16-bit and 32-bit supported for probe generation.")
+    
+    wf = wave.open(filename, 'wb')
+    wf.setnchannels(1)
+    wf.setsampwidth(2 if bit_depth == 16 else 4)
+    wf.setframerate(fs)
+    wf.writeframes(data.tobytes())
+    wf.close()
+
+# Load a WAV file (supports 8/16/24/32-bit PCM) and extract the left channel if stereo.
+def load_wave_any_depth(filename):
+    with wave.open(filename, 'rb') as wf:
+        nchan = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        fs = wf.getframerate()
+        nframes = wf.getnframes()
+        raw_bytes = wf.readframes(nframes)
+    
+    if sampwidth == 1:
+        samples = np.frombuffer(raw_bytes, dtype=np.int8)
+        max_val = 127.0
+    elif sampwidth == 2:
+        samples = np.frombuffer(raw_bytes, dtype=np.int16)
+        max_val = 32767.0
+    elif sampwidth == 3:
+        num_samples = len(raw_bytes) // 3
+        samples_32 = np.empty(num_samples, dtype=np.int32)
+        for i in range(num_samples):
+            b0 = raw_bytes[3 * i]
+            b1 = raw_bytes[3 * i + 1]
+            b2 = raw_bytes[3 * i + 2]
+            val = (b2 << 16) | (b1 << 8) | b0
+            if val & 0x800000:
+                val = val - 0x1000000
+            samples_32[i] = val
+        samples = samples_32
+        max_val = 8388607.0
+    elif sampwidth == 4:
+        samples = np.frombuffer(raw_bytes, dtype=np.int32)
+        max_val = 2147483647.0
+    else:
+        raise ValueError("Unsupported sample width: %d bytes" % sampwidth)
+    
+    if nchan > 1:
+        samples = samples[0::nchan]
+    float_data = samples.astype(np.float32) / max_val
+    return float_data, fs
+
+# Analyze stepped data by measuring the mean amplitude of each step in both signals.
+# Ignores the duplicated first and last steps.
+def analyze_steps(input_signal, output_signal, num_steps, samples_per_step):
+    step_in = []
+    step_out = []
+    # Total blocks = num_steps + 2; ignore the first and last blocks.
+    for i in range(1, num_steps + 1):
+        start_idx = i * samples_per_step
+        end_idx = start_idx + samples_per_step
+        if end_idx > len(input_signal) or end_idx > len(output_signal):
+            break
+        block_in = input_signal[start_idx:end_idx]
+        block_out = output_signal[start_idx:end_idx]
+        step_in.append(np.mean(block_in))
+        step_out.append(np.mean(block_out))
+    return np.array(step_in), np.array(step_out)
+
+# Normalize a curve to the range [-1, 1].
+def normalize_curve(y):
+    ymin = np.min(y)
+    ymax = np.max(y)
+    if ymax == ymin:
+        return y
+    return 2.0 * (y - ymin) / (ymax - ymin) - 1.0
+
+# Generate a C++ style array string from the lookup table data.
+def generate_cpp_array(data):
+    n = len(data)
+    header = (
+        "// Waveshaper lookup table\n"
+        "// Maps input amplitude (range -1.0 to 1.0) to processed output amplitude\n"
+        "// Efficient lookup using linear interpolation\n"
+        "// Precomputed scale: index = (x + 1.0f) * waveshaper_LUT_scale\n"
+        "// where waveshaper_LUT_scale = (waveshaper_table_size - 1) / 2.0f\n"
+        "// Usage:\n"
+        "//   float in = ...; // input amplitude in [-1.0, 1.0]\n"
+        "//   int index = (int)((in + 1.0f) * waveshaper_LUT_scale);\n"
+        "//   float frac = ((in + 1.0f) * waveshaper_LUT_scale) - index;\n"
+        "//   float out = waveshaper_table[index] * (1.0f - frac) + waveshaper_table[index + 1] * frac;\n\n"
+    )
+    array_decl = "const int waveshaper_table_size = %d;\n" % n
+    array_decl += "const float waveshaper_LUT_scale = (waveshaper_table_size - 1) / 2.0f;\n"
+    array_decl += "const float waveshaper_table[waveshaper_table_size] = {\n"
+    lines = []
+    per_line = 8
+    for i in range(0, n, per_line):
+        line_vals = data[i:i+per_line]
+        formatted_vals = ", ".join(f"{val:.6f}f" for val in line_vals)
+        lines.append("    " + formatted_vals)
+    array_decl += ",\n".join(lines) + "\n};\n"
+    return header + array_decl
+
+class WaveShaperTestUI(tk.Tk):
+    def __init__(self):
+        tk.Tk.__init__(self)
+        self.title("Waveshaper Test Utility")
+        self.geometry("900x700")
+        
+        # Top instructions.
+        instr_text = (
+            "Waveshaper Test Utility\n\n"
+            "Instructions:\n"
+            "  - Set step resolution (number of steps between -1 and 1).\n"
+            "  - Choose probe output bit depth (16-bit or 32-bit; 32-bit is recommended).\n"
+            "  - Generate a stepped test wave (.wav) (first and last steps are duplicated).\n"
+            "  - Load the processed wave (.wav) from your waveshaper (expected to be 24-bit).\n"
+            "  - Analyze & plot the measured input-output curve (ignores duplicated first and last steps).\n"
+            "  - Export the measured lookup table (LUT) as a C++ array.\n"
+        )
+        self.top_label = tk.Label(self, text=instr_text, justify="left", font=("Arial", 10))
+        self.top_label.pack(pady=10, padx=10, fill="x")
+        
+        # Main container frame.
+        main_frame = tk.Frame(self)
+        main_frame.pack(expand=True, fill="both", padx=10, pady=10)
+        
+        # Left frame: Test Wave generation, loading, analysis and LUT export.
+        self.left_frame = tk.Frame(main_frame, relief="groove", borderwidth=2)
+        self.left_frame.pack(expand=True, fill="both", padx=5, pady=5)
+        tk.Label(self.left_frame, text="Test Wave & LUT Export", font=("Arial", 12, "bold")).pack(pady=10)
+        
+        # Parameters frame: step resolution slider and bit depth options.
+        param_frame = tk.Frame(self.left_frame)
+        param_frame.pack(pady=5, padx=10, fill="x")
+        
+        # Step resolution slider.
+        res_label = tk.Label(param_frame, text="Step Resolution:")
+        res_label.grid(row=0, column=0, sticky="w")
+        self.res_scale = tk.Scale(param_frame, from_=1, to=10, orient=tk.HORIZONTAL)
+        self.res_scale.set(8)
+        self.res_scale.grid(row=0, column=1, sticky="we")
+        
+        # Bit depth selection.
+        bit_depth_label = tk.Label(param_frame, text="Probe Output Bit Depth:")
+        bit_depth_label.grid(row=1, column=0, sticky="w")
+        self.bit_depth_var = tk.IntVar(value=32)
+        rb16 = tk.Radiobutton(param_frame, text="16-bit", variable=self.bit_depth_var, value=16)
+        rb16.grid(row=1, column=1, sticky="w")
+        rb32 = tk.Radiobutton(param_frame, text="32-bit", variable=self.bit_depth_var, value=32)
+        rb32.grid(row=1, column=2, sticky="w")
+        
+        # Buttons.
+        self.btn_generate = tk.Button(self.left_frame, text="Generate Stepped Test Wave (.wav)", command=self.on_generate)
+        self.btn_generate.pack(pady=5, fill="x", padx=10)
+        self.btn_load_processed = tk.Button(self.left_frame, text="Load Processed Wave (.wav)", command=self.on_load_processed)
+        self.btn_load_processed.pack(pady=5, fill="x", padx=10)
+        self.btn_analyze = tk.Button(self.left_frame, text="Analyze & Plot Measured Curve", command=self.on_analyze)
+        self.btn_analyze.pack(pady=5, fill="x", padx=10)
+        self.btn_export = tk.Button(self.left_frame, text="Export Measured LUT (C++ Array)", command=self.on_export_array)
+        self.btn_export.pack(pady=5, fill="x", padx=10)
+        
+        # Embedded matplotlib canvas for measured curve display.
+        self.plot_frame = tk.Frame(self.left_frame)
+        self.plot_frame.pack(expand=True, fill="both", padx=10, pady=10)
+        self.measured_fig = plt.Figure(figsize=(5, 4), dpi=100)
+        self.measured_ax = self.measured_fig.add_subplot(111)
+        self.measured_canvas = FigureCanvasTkAgg(self.measured_fig, master=self.plot_frame)
+        self.measured_canvas.draw()
+        self.measured_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        # Quit button.
+        self.btn_quit = tk.Button(self, text="Quit", command=self.quit)
+        self.btn_quit.pack(pady=10)
+        
+        # Internal data variables.
+        self.test_wave_path = None
+        self.proc_wave_path = None
+        self.orig_data = None
+        self.proc_data = None
+        self.fs_orig = None
+        self.fs_proc = None
+        self.in_steps = None
+        self.out_steps = None
+        # Store resolution parameters.
+        self.num_steps = 8
+        self.samples_per_step = 1024
+
+    def on_generate(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Stepped Test Wave",
+            defaultextension=".wav",
+            filetypes=[("WAV files", "*.wav")]
+        )
+        if not path:
+            messagebox.showwarning("Warning", "No file selected.")
+            return
+        try:
+            self.num_steps = int(self.res_scale.get())
+            self.samples_per_step = 1024
+            bit_depth = self.bit_depth_var.get()
+            generate_stepped_wave(path, num_steps=self.num_steps, samples_per_step=self.samples_per_step, fs=48000, bit_depth=bit_depth)
+            self.test_wave_path = path
+            self.top_label.config(text=f"Test wave generated at:\n{path}\nProcess it externally using your waveshaper.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def on_load_processed(self):
+        if not self.test_wave_path:
+            messagebox.showwarning("Warning", "Generate a test wave first.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select Processed Wave File",
+            filetypes=[("WAV files", "*.wav")]
+        )
+        if not path:
+            messagebox.showwarning("Warning", "No file selected.")
+            return
+        try:
+            self.proc_data, self.fs_proc = load_wave_any_depth(path)
+            self.proc_wave_path = path
+            self.top_label.config(text=f"Processed wave loaded from:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def on_analyze(self):
+        if not self.test_wave_path or not self.proc_wave_path:
+            messagebox.showwarning("Warning", "Both a test wave and a processed wave are required.")
+            return
+        try:
+            self.orig_data, self.fs_orig = load_wave_any_depth(self.test_wave_path)
+            in_steps, out_steps = analyze_steps(self.orig_data, self.proc_data, num_steps=self.num_steps, samples_per_step=self.samples_per_step)
+            if len(in_steps) == 0 or len(out_steps) == 0:
+                messagebox.showwarning("Warning", "No valid step blocks found. Possibly the test wave is too short.")
+                return
+            self.in_steps = normalize_curve(in_steps)
+            self.out_steps = normalize_curve(out_steps)
+            self.update_measured_plot()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def update_measured_plot(self):
+        self.measured_ax.clear()
+        self.measured_ax.plot(self.in_steps, self.out_steps, 'o-', markersize=3, linewidth=1, label="Measured")
+        self.measured_ax.set_xlabel("Input Amplitude")
+        self.measured_ax.set_ylabel("Output Amplitude")
+        self.measured_ax.set_title("Waveshaper Input-Output Curve")
+        self.measured_ax.legend()
+        self.measured_ax.grid(True)
+        self.measured_canvas.draw()
+
+    def on_export_array(self):
+        if self.out_steps is None:
+            messagebox.showwarning("Warning", "Run analysis first to generate measured data.")
+            return
+        export_data = normalize_curve(self.out_steps)
+        path = filedialog.asksaveasfilename(
+            title="Save C++ Lookup Table",
+            defaultextension=".h",
+            filetypes=[("Header Files", "*.h"), ("C++ Files", "*.cpp")]
+        )
+        if not path:
+            messagebox.showwarning("Warning", "No file selected.")
+            return
+        try:
+            cpp_array_str = generate_cpp_array(export_data)
+            with open(path, 'w') as f:
+                f.write(cpp_array_str)
+            self.top_label.config(text=f"Lookup table exported to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+def main():
+    app = WaveShaperTestUI()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
