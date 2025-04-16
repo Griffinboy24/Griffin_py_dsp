@@ -12,7 +12,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 # Each step is held for samples_per_step frames.
 # Instead of silence pads, the first and last steps are duplicated.
 # Bit depth can be either 16 or 32.
-def generate_stepped_wave(filename, num_steps=8192, samples_per_step=1024, fs=48000, bit_depth=32):
+def generate_stepped_wave(filename, num_steps=4096, samples_per_step=1024, fs=48000, bit_depth=32):
     pad_samples = 1024
     # Generate evenly spaced step values in the range [-1, 1].
     step_values = np.linspace(-1.0, 1.0, num_steps, endpoint=True).astype(np.float32)
@@ -150,7 +150,7 @@ def analyze_steps(input_signal, output_signal, num_steps, samples_per_step):
         step_out.append(np.mean(block_out))
     return np.array(step_in), np.array(step_out)
 
-# Normalize a curve to the range [-1, 1].
+# Normalize a curve to the range [-1, 1] using an affine transform.
 def normalize_curve(y):
     ymin = np.min(y)
     ymax = np.max(y)
@@ -207,16 +207,16 @@ class WaveShaperTestUI(tk.Tk):
         # Top instructions.
         instr_text = (
             "Waveshaper Test Utility\n\n"
-            "Left Column:\n"
-            "  - Set quality factor (direct number of steps); default is 8192.\n"
-            "  - Choose probe output bit depth (16-bit or 32-bit; 32-bit is recommended).\n"
-            "  - Generate a stepped test wave (.wav) with duplicated first and last steps.\n"
-            "  - Load the processed wave (.wav) from your waveshaper (expected to be 24-bit).\n"
-            "  - Analyze & plot the measured input-output curve.\n"
-            "  - Export the measured lookup table (LUT) as a C++ array.\n\n"
+            "Left Column (Steps):\n"
+            "  Step 1: Set quality factor (number of steps) using the slider below.\n"
+            "  Step 2: Choose probe output bit depth (16-bit or 32-bit; 32-bit is recommended).\n"
+            "  Step 3: Generate a stepped test wave (.wav) with duplicated first and last steps.\n"
+            "  Step 4: Load the processed wave (.wav) from your waveshaper (expected to be 24-bit).\n"
+            "  Step 5: Analyze & plot the measured input-output curve.\n"
+            "  Step 6: Export the measured lookup table (LUT) as a C++ array.\n\n"
             "Right Column:\n"
-            "  - Enter a custom waveshaper expression (use 'x' for input), e.g. np.clip(np.tanh(3*x), -0.8, 0.8).\n"
-            "  - The custom curve updates automatically as you edit."
+            "  Enter a custom waveshaper expression (use 'x' for input), e.g. np.clip(np.tanh(3*x), -0.8, 0.8).\n"
+            "  The custom curve updates automatically as you edit."
         )
         self.top_label = tk.Label(self, text=instr_text, justify="left", font=("Arial", 10))
         self.top_label.pack(pady=10, padx=10, fill="x")
@@ -234,31 +234,43 @@ class WaveShaperTestUI(tk.Tk):
         param_frame = tk.Frame(self.left_frame)
         param_frame.pack(pady=5, padx=10, fill="x")
         
-        # Quality slider: directly representing the number of steps.
-        # Range from 256 to 32768 in steps of 256, default 8192.
+        # Define allowed quality step values (power-of-two) and default.
+        self.quality_values = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+        # Quality slider: now uses an index from 0 to 7.
         quality_label = tk.Label(param_frame, text="Quality Factor (Number of Steps):")
         quality_label.grid(row=0, column=0, sticky="w")
-        self.quality_scale = tk.Scale(param_frame, from_=256, to=32768, resolution=256, orient=tk.HORIZONTAL)
-        self.quality_scale.set(8192)
+        self.quality_scale = tk.Scale(param_frame, from_=0, to=len(self.quality_values)-1,
+                                      resolution=1, orient=tk.HORIZONTAL,
+                                      command=self.update_quality_label)
+        self.quality_scale.set(self.quality_values.index(4096))  # default of 4096.
         self.quality_scale.grid(row=0, column=1, sticky="we")
+        # Label showing the actual quality value.
+        self.quality_value_label = tk.Label(param_frame, text=str(self.quality_values[self.quality_scale.get()]))
+        self.quality_value_label.grid(row=0, column=2, padx=5)
+        
+        # Tick labels for each step.
+        tick_frame = tk.Frame(param_frame)
+        tick_frame.grid(row=1, column=1, sticky="we")
+        for i, val in enumerate(self.quality_values):
+            tk.Label(tick_frame, text=str(val)).grid(row=0, column=i, padx=5)
         
         # Bit depth selection.
         bit_depth_label = tk.Label(param_frame, text="Probe Output Bit Depth:")
-        bit_depth_label.grid(row=1, column=0, sticky="w")
+        bit_depth_label.grid(row=2, column=0, sticky="w", pady=(10,0))
         self.bit_depth_var = tk.IntVar(value=32)
         rb16 = tk.Radiobutton(param_frame, text="16-bit", variable=self.bit_depth_var, value=16)
-        rb16.grid(row=1, column=1, sticky="w")
+        rb16.grid(row=2, column=1, sticky="w", pady=(10,0))
         rb32 = tk.Radiobutton(param_frame, text="32-bit", variable=self.bit_depth_var, value=32)
-        rb32.grid(row=1, column=2, sticky="w")
+        rb32.grid(row=2, column=2, sticky="w", pady=(10,0))
         
-        # Left frame buttons.
-        self.btn_generate = tk.Button(self.left_frame, text="Generate Stepped Test Wave (.wav)", command=self.on_generate)
+        # Left frame buttons labeled as steps.
+        self.btn_generate = tk.Button(self.left_frame, text="Step 1: Generate Stepped Test Wave (.wav)", command=self.on_generate)
         self.btn_generate.pack(pady=5, fill="x", padx=10)
-        self.btn_load_processed = tk.Button(self.left_frame, text="Load Processed Wave (.wav)", command=self.on_load_processed)
+        self.btn_load_processed = tk.Button(self.left_frame, text="Step 2: Load Processed Wave (.wav)", command=self.on_load_processed)
         self.btn_load_processed.pack(pady=5, fill="x", padx=10)
-        self.btn_analyze = tk.Button(self.left_frame, text="Analyze & Plot Measured Curve", command=self.on_analyze)
+        self.btn_analyze = tk.Button(self.left_frame, text="Step 3: Analyze & Plot Measured Curve", command=self.on_analyze)
         self.btn_analyze.pack(pady=5, fill="x", padx=10)
-        self.btn_export = tk.Button(self.left_frame, text="Export Measured LUT (C++ Array)", command=self.on_export_array)
+        self.btn_export = tk.Button(self.left_frame, text="Step 4: Export Measured LUT (C++ Array)", command=self.on_export_array)
         self.btn_export.pack(pady=5, fill="x", padx=10)
         
         # Right frame: Custom waveshaper comparison.
@@ -296,8 +308,13 @@ class WaveShaperTestUI(tk.Tk):
         self.in_steps = None
         self.out_steps = None
         # Parameters for generation and analysis.
-        self.num_steps = 8192
+        self.num_steps = self.quality_values[self.quality_scale.get()]
         self.samples_per_step = 1024
+
+    def update_quality_label(self, event):
+        # Update the label next to the quality slider to display the actual power-of-two value.
+        val = self.quality_values[int(self.quality_scale.get())]
+        self.quality_value_label.config(text=str(val))
 
     def on_generate(self):
         path = filedialog.asksaveasfilename(
@@ -309,14 +326,15 @@ class WaveShaperTestUI(tk.Tk):
             messagebox.showwarning("Warning", "No file selected.")
             return
         try:
-            self.num_steps = int(self.quality_scale.get())
+            # Map the slider index to the actual number of steps.
+            self.num_steps = self.quality_values[self.quality_scale.get()]
             self.samples_per_step = 1024
             bit_depth = self.bit_depth_var.get()
             generate_stepped_wave(path, num_steps=self.num_steps,
                                   samples_per_step=self.samples_per_step,
                                   fs=48000, bit_depth=bit_depth)
             self.test_wave_path = path
-            self.top_label.config(text=f"Test wave generated at:\n{path}\nProcess it externally using your waveshaper.")
+            self.top_label.config(text="Test wave generated at:\n" + path + "\nProcess it externally using your waveshaper.")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
@@ -343,7 +361,7 @@ class WaveShaperTestUI(tk.Tk):
                 self.update_idletasks()
             self.proc_data, self.fs_proc = load_wave_any_depth_progress(path, progress_callback=progress_update)
             self.proc_wave_path = path
-            self.top_label.config(text=f"Processed wave loaded from:\n{path}")
+            self.top_label.config(text="Processed wave loaded from:\n" + path)
         except Exception as e:
             messagebox.showerror("Error", str(e))
             self.progress_bar.pack_forget()
@@ -366,9 +384,15 @@ class WaveShaperTestUI(tk.Tk):
             if len(in_steps) == 0 or len(out_steps) == 0:
                 messagebox.showwarning("Warning", "No valid step blocks found. Possibly too short.")
                 return
-            # Normalize the measured curves.
+            # Normalize the measured input curve using an affine transform.
             self.in_steps = normalize_curve(in_steps)
-            self.out_steps = normalize_curve(out_steps)
+            # Normalize the LUT by multiplying each entry by a scale factor.
+            max_abs = np.max(np.abs(out_steps))
+            if max_abs != 0:
+                scale_factor = 1.0 / max_abs
+            else:
+                scale_factor = 1.0
+            self.out_steps = out_steps * scale_factor
             plot_io_curve(self.in_steps, self.out_steps)
             self.update_custom_plot()
         except Exception as e:
@@ -418,7 +442,8 @@ class WaveShaperTestUI(tk.Tk):
         if self.out_steps is None:
             messagebox.showwarning("Warning", "Run analysis first to generate measured data.")
             return
-        export_data = normalize_curve(self.out_steps)
+        # Export the LUT that has already been normalized by multiplication.
+        export_data = self.out_steps
         path = filedialog.asksaveasfilename(
             title="Save C++ Lookup Table",
             defaultextension=".h",
@@ -431,7 +456,7 @@ class WaveShaperTestUI(tk.Tk):
             cpp_array_str = generate_cpp_array(export_data)
             with open(path, 'w') as f:
                 f.write(cpp_array_str)
-            self.top_label.config(text=f"Lookup table exported to:\n{path}")
+            self.top_label.config(text="Lookup table exported to:\n" + path)
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
